@@ -1,5 +1,8 @@
 fn main() {
-    let mut res = winresource::WindowsResource::new();
-    res.set_icon("chkn-logo.ico");
-    res.compile().unwrap();
+    #[cfg(target_os = "windows")]
+    {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("chkn-logo.ico");
+        res.compile().unwrap();
+    }
 }
