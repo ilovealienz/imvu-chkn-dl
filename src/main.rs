@@ -13,7 +13,7 @@ use std::{
 
 const FONT_BYTES: &[u8] = include_bytes!("../JetBrainsMono-Regular.ttf");
 const FONT_INTER: &[u8] = include_bytes!("../InterVariable.ttf");
-const ICON_PNG: &[u8] = include_bytes!("../chkn-logo-256.png");
+const ICON_PNG:   &[u8] = include_bytes!("../chkn-logo-32.png");
 
 #[derive(Debug, Clone, Deserialize)]
 struct ManifestEntry {
@@ -788,7 +788,7 @@ impl App {
             c.delete_state = CacheDeleteState::Done;
             c.entries.clear();
             c.total_size = 0;
-            c.loaded = false;
+            c.loaded = true;
             ctx2.request_repaint();
         });
     }
@@ -1068,7 +1068,9 @@ impl App {
                                     thread::spawn(move || {
                                         if let Ok(resp) = reqwest::blocking::get(&url2) {
                                             if let Ok(bytes) = resp.bytes() {
-                                                if let Ok(img) = image::load_from_memory(&bytes) {
+                                                let img_result = image::load_from_memory(&bytes)
+                                                    .or_else(|_| image::load_from_memory_with_format(&bytes, image::ImageFormat::Tga));
+                                                if let Ok(img) = img_result {
                                                     let rgba = img.to_rgba8();
                                                     let (orig_w, orig_h) = rgba.dimensions();
                                                     let (dw, dh, pixels) = if orig_w > 256 || orig_h > 256 {
@@ -1116,7 +1118,9 @@ impl App {
                                             thread::spawn(move || {
                                                 if let Ok(resp) = reqwest::blocking::get(&furl) {
                                                     if let Ok(bytes) = resp.bytes() {
-                                                        if let Ok(img) = image::load_from_memory(&bytes) {
+                                                        let img_result = image::load_from_memory(&bytes)
+                                                            .or_else(|_| image::load_from_memory_with_format(&bytes, image::ImageFormat::Tga));
+                                                        if let Ok(img) = img_result {
                                                             let rgba = img.to_rgba8();
                                                             let (w, h) = rgba.dimensions();
                                                             pending.lock().unwrap().push((fkey, w, h, w, h, rgba.into_raw()));
@@ -1138,8 +1142,7 @@ impl App {
                                     Some(resp)
                                 }
                                 Some(TexEntry::Failed) => {
-                                    if !entry.name.contains('.') {
-                                        // Not an image — show as a file tag inline
+                                    if !entry.name.contains('.') || !is_media(&entry.name) {
                                         let muted_color = egui::Color32::from_rgb(110, 90, 100);
                                         egui::Frame::none()
                                             .fill(egui::Color32::from_rgb(26, 15, 22))
@@ -1150,7 +1153,7 @@ impl App {
                                             });
                                         None
                                     } else {
-                                        placeholder(ui, "X")
+                                        placeholder(ui, "X").map(|r| r.on_hover_text(&entry.name))
                                     }
                                 }
                             };
@@ -1228,6 +1231,7 @@ impl App {
                                 "xrf"         => egui::Color32::from_rgb(100, 160, 220),
                                 "xmf"         => egui::Color32::from_rgb(80,  130, 200),
                                 "xcf" | "xof" => egui::Color32::from_rgb(140, 100, 200),
+                                "xpf"         => egui::Color32::from_rgb(180, 110, 50),
                                 "xml"         => egui::Color32::from_rgb(100, 190, 130),
                                 _             => egui::Color32::from_rgb(110, 90, 100),
                             };
@@ -1643,8 +1647,8 @@ fn extract_pid(s: &str) -> Option<u64> {
     s.trim().parse().ok()
 }
 
-const MEDIA_EXTS: &[&str] = &["png","jpg","jpeg","gif","bmp","dds","tga","webp","tiff","tif"];
-const MESH_EXTS:  &[&str] = &["xsf","xaf","xrf","xmf","xcf","xof"];
+const MEDIA_EXTS: &[&str] = &["png","jpg","jpeg","gif","bmp","tga","webp","tiff","tif"];
+const MESH_EXTS:  &[&str] = &["xsf","xaf","xrf","xmf","xcf","xof","xpf"];
 
 fn file_ext(name: &str) -> Option<&str> {
     let ext = name.rsplit('.').next()?;
