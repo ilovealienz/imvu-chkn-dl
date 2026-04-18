@@ -13,7 +13,7 @@ a little tool for grabbing IMVU product files — paste in a product ID or URL, 
 
 ## download
 
-grab the latest build from the [releases page](../../releases) — there's a windows and linux version.
+grab the latest build from the [releases page](../../releases)
 
 ## building yourself
 
