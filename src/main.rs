@@ -4,11 +4,12 @@ use eframe::egui;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    io::Write,
+    io::{Read, Seek, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
     thread,
 };
+
 
 const FONT_BYTES: &[u8] = include_bytes!("../JetBrainsMono-Regular.ttf");
 const FONT_INTER: &[u8] = include_bytes!("../InterVariable.ttf");
@@ -34,6 +35,16 @@ struct ProductInfo {
     allows_derivation:  bool,
 }
 
+#[derive(Debug, Clone)]
+struct LightboxEntry {
+    key:       String,
+    name:      String,
+    orig_w:    u32,
+    orig_h:    u32,
+    format:    String,
+    fetch_url: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum DownloadMode { Chkn, AllExtracted, MediaOnly }
 
@@ -56,6 +67,48 @@ enum State {
     Error(String),
 }
 
+
+
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    pid:      u64,
+    files:    Vec<String>,
+    size:     u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CacheDeleteState {
+    Idle,
+    Deleting { done: usize, total: usize },
+    Done,
+    Error(String),
+}
+
+#[derive(Clone)]
+struct CacheTab {
+    entries:      Vec<CacheEntry>,
+    total_size:   u64,
+    loading:      bool,
+    loaded:       bool,
+    delete_state:   CacheDeleteState,
+    search:         String,
+    confirm_delete: bool,
+}
+
+impl Default for CacheTab {
+    fn default() -> Self {
+        Self {
+            entries:      Vec::new(),
+            total_size:   0,
+            loading:      false,
+            loaded:       false,
+            delete_state:   CacheDeleteState::Idle,
+            search:         String::new(),
+            confirm_delete: false,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Settings {
     scan_batch:     usize,
@@ -67,7 +120,7 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { scan_batch: 5, scan_start_rev: 1, scan_max_rev: 100, dl_batch: 4, show_advanced: false }
+        Self { scan_batch: 10, scan_start_rev: 1, scan_max_rev: 60, dl_batch: 10, show_advanced: false }
     }
 }
 
@@ -92,6 +145,9 @@ struct App {
     product_info:     Arc<Mutex<Option<ProductInfo>>>,
     single_dl:        Arc<Mutex<Option<SingleDlState>>>,
     rev_reversed:     bool,
+    lightbox:         Option<LightboxEntry>,
+    show_cache:       bool,
+    cache_tab:        Arc<Mutex<CacheTab>>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +173,9 @@ impl Default for App {
             product_info: Arc::new(Mutex::new(None)),
             single_dl:    Arc::new(Mutex::new(None)),
             rev_reversed: true,
+            lightbox:     None,
+            show_cache:   false,
+            cache_tab:    Arc::new(Mutex::new(CacheTab::default())),
         }
     }
 }
@@ -128,6 +187,10 @@ impl eframe::App for App {
             if !pending.is_empty() {
                 let mut cache = self.textures.lock().unwrap();
                 for (key, orig_w, orig_h, dw, dh, rgba) in pending.drain(..) {
+                    if dw == 0 || dh == 0 {
+                        cache.insert(key, TexEntry::Failed);
+                        continue;
+                    }
                     let img = egui::ColorImage::from_rgba_unmultiplied([dw as usize, dh as usize], &rgba);
                     let handle = ctx.load_texture(&key, img, egui::TextureOptions::LINEAR);
                     cache.insert(key.clone(), TexEntry::Loaded(handle));
@@ -171,318 +234,781 @@ impl eframe::App for App {
                         .size(11.0).color(egui::Color32::from_rgb(90, 55, 75)).italics());
                 });
             });
-            ui.add_space(8.0);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let cache_lbl = if self.show_cache { "hide cache" } else { "view cache" };
+                let cache_link = egui::Button::new(
+                    egui::RichText::new(cache_lbl).size(10.0).color(muted).italics()
+                )
+                .fill(egui::Color32::TRANSPARENT)
+                .frame(false);
+                if ui.add(cache_link).clicked() {
+                    self.show_cache = !self.show_cache;
+                    if self.show_cache && !self.cache_tab.lock().unwrap().loaded && !self.cache_tab.lock().unwrap().loading {
+                        self.load_cache(ctx);
+                    }
+                }
+            });
+            ui.add_space(4.0);
             ui.separator();
-            ui.add_space(10.0);
+            ui.add_space(6.0);
+
+            if self.show_cache {
+                self.draw_cache_tab(ui, ctx, pink, muted, green, red, amber);
+            } else {
 
             // Input
-            ui.horizontal(|ui| {
-                let scanning = state == State::Scanning;
-                let w = ui.available_width() - 80.0;
-                ui.add(egui::TextEdit::singleline(&mut self.input)
-                    .desired_width(w)
-                    .hint_text("44576114  or  https://www.imvu.com/shop/product.php?products_id=44576114")
-                );
-                let b = egui::Button::new(
-                    egui::RichText::new(if scanning { "..." } else { "Scan" })
-                        .color(egui::Color32::WHITE).size(14.0)
-                )
-                .fill(egui::Color32::from_rgb(175, 55, 105))
-                .rounding(egui::Rounding::same(6.0));
-                if ui.add_enabled(!scanning, b).clicked()
-                    || (ui.input(|i| i.key_pressed(egui::Key::Enter)) && !scanning)
-                { self.start_scan(ctx); }
-            });
-
-            ui.add_space(8.0);
-
-            // Save dir + advanced toggle
-            ui.horizontal(|ui| {
-                let dir_txt = self.save_dir.as_ref()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Downloads folder".into());
-                ui.label(egui::RichText::new(format!("Save to: {}", dir_txt))
-                    .size(11.0).color(muted).italics());
-                if ui.small_button("Choose...").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().pick_folder() { self.save_dir = Some(p); }
-                }
-                if self.save_dir.is_some() && ui.small_button("X").clicked() { self.save_dir = None; }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let lbl = if self.settings.show_advanced { "^ Advanced" } else { "v Advanced" };
-                    if ui.small_button(lbl).clicked() { self.settings.show_advanced = !self.settings.show_advanced; }
+                ui.horizontal(|ui| {
+                    let scanning = state == State::Scanning;
+                    let w = ui.available_width() - 80.0;
+                    ui.add(egui::TextEdit::singleline(&mut self.input)
+                        .desired_width(w)
+                        .hint_text("44576114  or  https://www.imvu.com/shop/product.php?products_id=44576114")
+                    );
+                    let b = egui::Button::new(
+                        egui::RichText::new(if scanning { "..." } else { "Scan" })
+                            .color(egui::Color32::WHITE).size(14.0)
+                    )
+                    .fill(egui::Color32::from_rgb(175, 55, 105))
+                    .rounding(egui::Rounding::same(6.0));
+                    if ui.add_enabled(!scanning, b).clicked()
+                        || (ui.input(|i| i.key_pressed(egui::Key::Enter)) && !scanning)
+                    { self.start_scan(ctx); }
                 });
-            });
 
-            if self.settings.show_advanced {
                 ui.add_space(8.0);
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(28, 16, 24))
-                    .rounding(egui::Rounding::same(6.0))
-                    .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("Advanced Settings").size(12.0).color(amber));
-                        ui.add_space(8.0);
-                        egui::Grid::new("adv").num_columns(2).spacing([20.0, 6.0]).show(ui, |ui| {
-                            ui.label(egui::RichText::new("Scan batch size").size(12.0).color(muted));
-                            ui.add(egui::Slider::new(&mut self.settings.scan_batch, 1..=20).suffix(" parallel"));
-                            ui.end_row();
-                            ui.label(egui::RichText::new("Start from revision").size(12.0).color(muted));
-                            ui.add(egui::Slider::new(&mut self.settings.scan_start_rev, 1..=50));
-                            ui.end_row();
-                            ui.label(egui::RichText::new("Scan down from rev").size(12.0).color(muted));
-                            ui.horizontal(|ui| {
-                                ui.add(egui::Slider::new(&mut self.settings.scan_max_rev, 10..=500));
-                                ui.label(egui::RichText::new("(fallback if going up finds nothing)")
-                                    .size(10.0).color(muted).italics());
+
+                // Save dir + advanced toggle
+                ui.horizontal(|ui| {
+                    let dir_txt = self.save_dir.as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Downloads folder".into());
+                    ui.label(egui::RichText::new(format!("Save to: {}", dir_txt))
+                        .size(11.0).color(muted).italics());
+                    if ui.small_button("Choose...").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().pick_folder() { self.save_dir = Some(p); }
+                    }
+                    if self.save_dir.is_some() && ui.small_button("X").clicked() { self.save_dir = None; }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let lbl = if self.settings.show_advanced { "^ Advanced" } else { "v Advanced" };
+                        if ui.small_button(lbl).clicked() { self.settings.show_advanced = !self.settings.show_advanced; }
+                    });
+                });
+
+                if self.settings.show_advanced {
+                    ui.add_space(8.0);
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(28, 16, 24))
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Advanced Settings").size(12.0).color(amber));
+                            ui.add_space(8.0);
+                            egui::Grid::new("adv").num_columns(2).spacing([20.0, 6.0]).show(ui, |ui| {
+                                ui.label(egui::RichText::new("Scan batch size").size(12.0).color(muted));
+                                ui.add(egui::Slider::new(&mut self.settings.scan_batch, 1..=20).suffix(" parallel"));
+                                ui.end_row();
+                                ui.label(egui::RichText::new("Start from revision").size(12.0).color(muted));
+                                ui.add(egui::Slider::new(&mut self.settings.scan_start_rev, 1..=50));
+                                ui.end_row();
+                                ui.label(egui::RichText::new("Scan down from rev").size(12.0).color(muted));
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Slider::new(&mut self.settings.scan_max_rev, 10..=500));
+                                    ui.label(egui::RichText::new("(fallback if going up finds nothing)")
+                                        .size(10.0).color(muted).italics());
+                                });
+                                ui.end_row();
+                                ui.label(egui::RichText::new("Download batch size").size(12.0).color(muted));
+                                ui.add(egui::Slider::new(&mut self.settings.dl_batch, 1..=16).suffix(" parallel"));
+                                ui.end_row();
                             });
-                            ui.end_row();
-                            ui.label(egui::RichText::new("Download batch size").size(12.0).color(muted));
-                            ui.add(egui::Slider::new(&mut self.settings.dl_batch, 1..=16).suffix(" parallel"));
-                            ui.end_row();
                         });
-                    });
-            }
+                }
 
-            ui.add_space(8.0);
+                ui.add_space(8.0);
 
-            // State feedback
-            match &state {
-                State::Idle | State::Ready => {}
-                State::Scanning => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(egui::RichText::new(self.log.lock().unwrap().clone()).size(12.0).color(muted));
-                    });
-                    ctx.request_repaint();
-                }
-                State::Error(msg) => {
-                    ui.label(egui::RichText::new(format!("  {}", msg)).size(13.0).color(red));
-                }
-                State::Done { path, label } => {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("Done: {}", label)).size(13.0).color(green));
-                        let open_btn = egui::Button::new(
-                            egui::RichText::new("Open folder").size(12.0).color(egui::Color32::WHITE)
-                        )
-                        .fill(egui::Color32::from_rgb(40, 24, 35))
-                        .rounding(egui::Rounding::same(5.0));
-                        if ui.add(open_btn).clicked() {
-                            let folder = if path.is_dir() { path.clone() } else {
-                                path.parent().unwrap_or(path).to_path_buf()
-                            };
-                            let _ = open::that(&folder);
-                        }
-                    });
-                }
-                State::Downloading { .. } => {
-                    let p = *self.progress.lock().unwrap();
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(egui::RichText::new(self.log.lock().unwrap().clone()).size(12.0).color(muted));
-                    });
-                    ui.add(egui::ProgressBar::new(p).show_percentage());
-                    ctx.request_repaint();
-                }
-            }
-
-            // Single file download status
-            {
-                let sdl = self.single_dl.lock().unwrap().clone();
-                match sdl {
-                    Some(SingleDlState::Downloading(name)) => {
+                // State feedback
+                match &state {
+                    State::Idle | State::Ready => {}
+                    State::Scanning => {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(egui::RichText::new(format!("Saving {}...", name)).size(11.0).color(muted));
+                            ui.label(egui::RichText::new(self.log.lock().unwrap().clone()).size(12.0).color(muted));
                         });
                         ctx.request_repaint();
                     }
-                    Some(SingleDlState::Done(p)) => {
+                    State::Error(msg) => {
+                        ui.label(egui::RichText::new(format!("  {}", msg)).size(13.0).color(red));
+                    }
+                    State::Done { path, label } => {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("Saved: {}", p.file_name().unwrap_or_default().to_string_lossy())).size(11.0).color(green));
-                            if ui.small_button("Open folder").clicked() {
-                                let folder = p.parent().unwrap_or(&p).to_path_buf();
+                            ui.label(egui::RichText::new(format!("Done: {}", label)).size(13.0).color(green));
+                            let open_btn = egui::Button::new(
+                                egui::RichText::new("Open folder").size(12.0).color(egui::Color32::WHITE)
+                            )
+                            .fill(egui::Color32::from_rgb(40, 24, 35))
+                            .rounding(egui::Rounding::same(5.0));
+                            if ui.add(open_btn).clicked() {
+                                let folder = if path.is_dir() { path.clone() } else {
+                                    path.parent().unwrap_or(path).to_path_buf()
+                                };
                                 let _ = open::that(&folder);
                             }
                         });
                     }
-                    Some(SingleDlState::Error(e)) => {
-                        ui.label(egui::RichText::new(format!("Save failed: {}", e)).size(11.0).color(red));
+                    State::Downloading { .. } => {
+                        let p = *self.progress.lock().unwrap();
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(egui::RichText::new(self.log.lock().unwrap().clone()).size(12.0).color(muted));
+                        });
+                        ui.add(egui::ProgressBar::new(p).show_percentage());
+                        ctx.request_repaint();
                     }
-                    None => {}
                 }
-            }
 
-            // Product info
-            {
-                let info = self.product_info.lock().unwrap().clone();
-                if let Some(ref pi) = info {
-                    // Kick off thumbnail fetch
-                    let thumb_key = format!("product_thumb_{}", pi.shop_url);
-                    let thumb_state = self.textures.lock().unwrap().get(&thumb_key).cloned();
-                    if thumb_state.is_none() && !pi.product_image.is_empty() {
-                        self.textures.lock().unwrap().insert(thumb_key.clone(), TexEntry::Loading);
-                        let url2 = pi.product_image.clone();
-                        let key2 = thumb_key.clone();
-                        let pending = Arc::clone(&self.pending_tex);
-                        let ctx2 = ctx.clone();
-                        thread::spawn(move || {
-                            if let Ok(resp) = reqwest::blocking::get(&url2) {
-                                if let Ok(bytes) = resp.bytes() {
-                                    if let Ok(img) = image::load_from_memory(&bytes) {
-                                        let rgba = img.to_rgba8();
-                                        let (w, h) = rgba.dimensions();
-                                        pending.lock().unwrap().push((key2, w, h, w, h, rgba.into_raw()));
-                                        ctx2.request_repaint();
-                                    }
+                // Single file download status
+                {
+                    let sdl = self.single_dl.lock().unwrap().clone();
+                    match sdl {
+                        Some(SingleDlState::Downloading(name)) => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(egui::RichText::new(format!("Saving {}...", name)).size(11.0).color(muted));
+                            });
+                            ctx.request_repaint();
+                        }
+                        Some(SingleDlState::Done(p)) => {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!("Saved: {}", p.file_name().unwrap_or_default().to_string_lossy())).size(11.0).color(green));
+                                if ui.small_button("Open folder").clicked() {
+                                    let folder = p.parent().unwrap_or(&p).to_path_buf();
+                                    let _ = open::that(&folder);
+                                }
+                            });
+                        }
+                        Some(SingleDlState::Error(e)) => {
+                            ui.label(egui::RichText::new(format!("Save failed: {}", e)).size(11.0).color(red));
+                        }
+                        None => {}
+                    }
+                }
+
+                // Lightbox overlay
+                if let Some(lb) = self.lightbox.clone() {
+                    let screen = ctx.screen_rect();
+                    let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+                    ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("lb_dim")))
+                        .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(100));
+
+                    let aspect = if lb.orig_h > 0 { lb.orig_w as f32 / lb.orig_h as f32 } else { 1.0 };
+                    let cap_w = screen.width()  * 0.55;
+                    let cap_h = screen.height() * 0.55;
+                    let (img_w, img_h) = if cap_w / aspect <= cap_h {
+                        (cap_w, cap_w / aspect)
+                    } else {
+                        (cap_h * aspect, cap_h)
+                    };
+
+                    let mut close = escape;
+                    let mut save_clicked = false;
+
+                    let blocker = egui::Area::new(egui::Id::new("lb_blocker"))
+                        .order(egui::Order::PanelResizeLine)
+                        .fixed_pos(egui::pos2(0.0, 0.0))
+                        .show(ctx, |ui: &mut egui::Ui| {
+                            let (_, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                            ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(210));
+                            resp
+                        });
+                    if blocker.inner.clicked() { close = true; }
+
+                    egui::Window::new("##lightbox")
+                        .title_bar(false)
+                        .resizable(false)
+                        .collapsible(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .frame(egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(22, 12, 20))
+                            .rounding(egui::Rounding::same(10.0))
+                            .inner_margin(egui::Margin::same(16.0))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 35, 58))))
+                        .show(ctx, |ui: &mut egui::Ui| {
+                            let tex_state = self.textures.lock().unwrap().get(&lb.key).cloned();
+                            match tex_state {
+                                Some(TexEntry::Loaded(ref handle)) => {
+                                    ui.add(egui::Image::new(handle)
+                                        .fit_to_exact_size(egui::vec2(img_w, img_h))
+                                        .rounding(egui::Rounding::same(6.0)));
+                                }
+                                _ => {
+                                    let (r, _) = ui.allocate_exact_size(
+                                        egui::vec2(img_w, img_h), egui::Sense::hover());
+                                    ui.painter().rect_filled(r, 6.0, egui::Color32::from_rgb(28, 14, 24));
+                                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER,
+                                        "loading...", egui::FontId::proportional(14.0),
+                                        egui::Color32::from_rgb(90, 60, 80));
+                                    ctx.request_repaint();
                                 }
                             }
+
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+
+                            ui.label(egui::RichText::new(&lb.name)
+                                .size(13.0).color(egui::Color32::from_rgb(220, 170, 200)).strong());
+                            ui.add_space(4.0);
+
+                            ui.set_min_width(img_w);
+                            ui.horizontal(|ui: &mut egui::Ui| {
+                                ui.label(egui::RichText::new(
+                                    format!("{}x{}  {}", lb.orig_w, lb.orig_h, lb.format.to_uppercase()))
+                                    .size(12.0).color(egui::Color32::from_rgb(120, 85, 108)));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui: &mut egui::Ui| {
+                                    let save_btn = egui::Button::new(
+                                        egui::RichText::new("  Save  ").size(12.0)
+                                            .color(egui::Color32::WHITE).strong()
+                                    )
+                                    .fill(egui::Color32::from_rgb(175, 55, 105))
+                                    .rounding(egui::Rounding::same(6.0));
+                                    if ui.add(save_btn).clicked() { save_clicked = true; }
+                                    if ui.button(egui::RichText::new("  Close  ").size(12.0)
+                                        .color(egui::Color32::from_rgb(160, 120, 140)))
+                                        .clicked() { close = true; }
+                                });
+                            });
+                        });
+
+                    if save_clicked {
+                        let name     = lb.name.clone();
+                        let url      = lb.fetch_url.clone();
+                        let save_dir = self.save_dir.clone().unwrap_or_else(default_download_dir);
+                        let sdl      = Arc::clone(&self.single_dl);
+                        let ctx2     = ctx.clone();
+                        *sdl.lock().unwrap() = Some(SingleDlState::Downloading(name.clone()));
+                        thread::spawn(move || {
+                            let result = reqwest::blocking::get(&url).and_then(|resp| {
+                                let mime = resp.headers()
+                                    .get("content-type")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .split(';').next().unwrap_or("").trim().to_string();
+                                resp.bytes().map(|b| (mime, b))
+                            });
+                            match result {
+                                Ok((mime, bytes)) => {
+                                    let out  = fix_extension_mime(&name, &mime, &bytes);
+                                    let path = save_dir.join(&out);
+                                    match std::fs::write(&path, &bytes) {
+                                        Ok(_)  => *sdl.lock().unwrap() = Some(SingleDlState::Done(path)),
+                                        Err(e) => *sdl.lock().unwrap() = Some(SingleDlState::Error(e.to_string())),
+                                    }
+                                }
+                                Err(e) => *sdl.lock().unwrap() = Some(SingleDlState::Error(e.to_string())),
+                            }
+                            ctx2.request_repaint();
                         });
                     }
 
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        // Thumbnail
-                        match self.textures.lock().unwrap().get(&thumb_key).cloned() {
-                            Some(TexEntry::Loaded(handle)) => {
-                                ui.add(egui::Image::new(&handle)
-                                    .fit_to_exact_size(egui::vec2(100.0, 80.0))
-                                    .rounding(egui::Rounding::same(4.0)));
-                            }
-                            Some(TexEntry::Loading) | None => {
-                                let (r, _) = ui.allocate_exact_size(egui::vec2(100.0, 80.0), egui::Sense::hover());
-                                ui.painter().rect_filled(r, 4.0, egui::Color32::from_rgb(26, 15, 22));
-                                ctx.request_repaint();
-                            }
-                            Some(TexEntry::Failed) => {
-                                ui.allocate_exact_size(egui::vec2(100.0, 80.0), egui::Sense::hover());
-                            }
-                        }
+                    if close { self.lightbox = None; }
+                    ctx.request_repaint();
+                }
 
-                        ui.add_space(10.0);
-
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(&pi.name).size(18.0).color(pink).strong());
-                                if !pi.rating.is_empty() {
-                                    ui.label(egui::RichText::new(format!("[{}]", pi.rating))
-                                        .size(11.0).color(muted));
+                // Product info
+                {
+                    let info = self.product_info.lock().unwrap().clone();
+                    if let Some(ref pi) = info {
+                        let thumb_key = format!("product_thumb_{}", pi.shop_url);
+                        let thumb_state = self.textures.lock().unwrap().get(&thumb_key).cloned();
+                        if thumb_state.is_none() && !pi.product_image.is_empty() {
+                            self.textures.lock().unwrap().insert(thumb_key.clone(), TexEntry::Loading);
+                            let url2 = pi.product_image.clone();
+                            let key2 = thumb_key.clone();
+                            let pending = Arc::clone(&self.pending_tex);
+                            let ctx2 = ctx.clone();
+                            thread::spawn(move || {
+                                if let Ok(resp) = reqwest::blocking::get(&url2) {
+                                    if let Ok(bytes) = resp.bytes() {
+                                        if let Ok(img) = image::load_from_memory(&bytes) {
+                                            let rgba = img.to_rgba8();
+                                            let (w, h) = rgba.dimensions();
+                                            pending.lock().unwrap().push((key2, w, h, w, h, rgba.into_raw()));
+                                            ctx2.request_repaint();
+                                        }
+                                    }
                                 }
                             });
-                            if !pi.creator.is_empty() {
-                                ui.label(egui::RichText::new(
-                                    format!("by {}  (CID {})", pi.creator, pi.creator_cid))
-                                    .size(12.0).color(muted));
+                        }
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            match self.textures.lock().unwrap().get(&thumb_key).cloned() {
+                                Some(TexEntry::Loaded(handle)) => {
+                                    ui.add(egui::Image::new(&handle)
+                                        .fit_to_exact_size(egui::vec2(100.0, 80.0))
+                                        .rounding(egui::Rounding::same(4.0)));
+                                }
+                                Some(TexEntry::Loading) | None => {
+                                    let (r, _) = ui.allocate_exact_size(egui::vec2(100.0, 80.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(r, 4.0, egui::Color32::from_rgb(26, 15, 22));
+                                    ctx.request_repaint();
+                                }
+                                Some(TexEntry::Failed) => {
+                                    ui.allocate_exact_size(egui::vec2(100.0, 80.0), egui::Sense::hover());
+                                }
                             }
-                            if !pi.categories.is_empty() {
-                                ui.label(egui::RichText::new(pi.categories.join("  >  "))
-                                    .size(10.0).color(egui::Color32::from_rgb(100, 75, 90)));
-                            }
-                            // Parent — click to scan it
-                            if let Some(ppid) = pi.parent_id {
-                                ui.add_space(2.0);
+
+                            ui.add_space(10.0);
+
+                            ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("derives from:").size(10.0).color(muted));
-                                    let display = if pi.parent_name.is_empty() {
-                                        ppid.to_string()
-                                    } else {
-                                        pi.parent_name.clone()
-                                    };
-                                    let btn = egui::Button::new(
-                                        egui::RichText::new(&display).size(10.0)
-                                            .color(egui::Color32::from_rgb(180, 130, 220))
-                                    )
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .frame(false);
-                                    if ui.add(btn).on_hover_text(format!("scan product {}", ppid)).clicked() {
-                                        self.input = ppid.to_string();
-                                        self.start_scan(ctx);
+                                    ui.label(egui::RichText::new(&pi.name).size(18.0).color(pink).strong());
+                                    if !pi.rating.is_empty() {
+                                        ui.label(egui::RichText::new(format!("[{}]", pi.rating))
+                                            .size(11.0).color(muted));
                                     }
                                 });
-                            }
-                            ui.add_space(4.0);
-                            ui.horizontal_wrapped(|ui| {
-                                let link_color = egui::Color32::from_rgb(130, 100, 180);
-                                ui.hyperlink_to(
-                                    egui::RichText::new("product page").size(11.0).color(link_color),
-                                    &pi.shop_url,
-                                );
-                                ui.label(egui::RichText::new("|").size(11.0).color(egui::Color32::from_rgb(60, 35, 55)));
-                                let tree_url = format!("https://www.imvu.com/shop/derivation_tree.php?products_id={}",
-                                    pi.shop_url.split("products_id=").nth(1).unwrap_or(""));
-                                ui.hyperlink_to(
-                                    egui::RichText::new("derivation tree").size(11.0).color(link_color),
-                                    &tree_url,
-                                );
-                                if pi.allows_derivation {
+                                if !pi.creator.is_empty() {
+                                    ui.label(egui::RichText::new(
+                                        format!("by {}  (CID {})", pi.creator, pi.creator_cid))
+                                        .size(12.0).color(muted));
+                                }
+                                if !pi.categories.is_empty() {
+                                    ui.label(egui::RichText::new(pi.categories.join("  >  "))
+                                        .size(10.0).color(egui::Color32::from_rgb(100, 75, 90)));
+                                }
+                                if let Some(ppid) = pi.parent_id {
+                                    ui.add_space(2.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("derives from:").size(10.0).color(muted));
+                                        let display = if pi.parent_name.is_empty() {
+                                            ppid.to_string()
+                                        } else {
+                                            pi.parent_name.clone()
+                                        };
+                                        let btn = egui::Button::new(
+                                            egui::RichText::new(&display).size(10.0)
+                                                .color(egui::Color32::from_rgb(180, 130, 220))
+                                        )
+                                        .fill(egui::Color32::TRANSPARENT)
+                                        .frame(false);
+                                        if ui.add(btn).on_hover_text(format!("scan product {}", ppid)).clicked() {
+                                            self.input = ppid.to_string();
+                                            self.start_scan(ctx);
+                                        }
+                                    });
+                                }
+                                ui.add_space(4.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    let link_color = egui::Color32::from_rgb(130, 100, 180);
+                                    ui.hyperlink_to(
+                                        egui::RichText::new("product page").size(11.0).color(link_color),
+                                        &pi.shop_url,
+                                    );
                                     ui.label(egui::RichText::new("|").size(11.0).color(egui::Color32::from_rgb(60, 35, 55)));
-                                    let derived_url = format!("https://www.imvu.com/shop/web_search.php?derived_from={}",
+                                    let tree_url = format!("https://www.imvu.com/shop/derivation_tree.php?products_id={}",
                                         pi.shop_url.split("products_id=").nth(1).unwrap_or(""));
                                     ui.hyperlink_to(
-                                        egui::RichText::new("derived products").size(11.0).color(link_color),
-                                        &derived_url,
+                                        egui::RichText::new("derivation tree").size(11.0).color(link_color),
+                                        &tree_url,
                                     );
-                                }
-                                if pi.creator_cid > 0 {
-                                    ui.label(egui::RichText::new("|").size(11.0).color(egui::Color32::from_rgb(60, 35, 55)));
-                                    let shop_url = format!("https://www.imvu.com/shop/web_search.php?manufacturers_id={}",
-                                        pi.creator_cid);
-                                    ui.hyperlink_to(
-                                        egui::RichText::new("creator's shop").size(11.0).color(link_color),
-                                        &shop_url,
-                                    );
-                                }
+                                    if pi.allows_derivation {
+                                        ui.label(egui::RichText::new("|").size(11.0).color(egui::Color32::from_rgb(60, 35, 55)));
+                                        let derived_url = format!("https://www.imvu.com/shop/web_search.php?derived_from={}",
+                                            pi.shop_url.split("products_id=").nth(1).unwrap_or(""));
+                                        ui.hyperlink_to(
+                                            egui::RichText::new("derived products").size(11.0).color(link_color),
+                                            &derived_url,
+                                        );
+                                    }
+                                    if pi.creator_cid > 0 {
+                                        ui.label(egui::RichText::new("|").size(11.0).color(egui::Color32::from_rgb(60, 35, 55)));
+                                        let shop_url = format!("https://www.imvu.com/shop/web_search.php?manufacturers_id={}",
+                                            pi.creator_cid);
+                                        ui.hyperlink_to(
+                                            egui::RichText::new("creator's shop").size(11.0).color(link_color),
+                                            &shop_url,
+                                        );
+                                    }
+                                });
                             });
                         });
-                    });
+                    }
                 }
-            }
 
-            // Revision list
-            let revisions = self.revisions.lock().unwrap().clone();
-            if !revisions.is_empty() {
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
-                let pid      = self.pid.unwrap_or(0);
-                let busy     = matches!(state, State::Downloading { .. } | State::Scanning);
-                let dl_batch = self.settings.dl_batch;
-                let save_dir = self.save_dir.clone().unwrap_or_else(default_download_dir);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{} revision(s)", revisions.len()))
-                        .size(11.0).color(muted));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let order_lbl = if self.rev_reversed { "newest first" } else { "oldest first" };
-                        if ui.small_button(order_lbl).clicked() {
-                            self.rev_reversed = !self.rev_reversed;
+                // Revision list
+                let revisions = self.revisions.lock().unwrap().clone();
+                if !revisions.is_empty() {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    let pid      = self.pid.unwrap_or(0);
+                    let busy     = matches!(state, State::Downloading { .. } | State::Scanning);
+                    let dl_batch = self.settings.dl_batch;
+                    let save_dir = self.save_dir.clone().unwrap_or_else(default_download_dir);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{} revision(s)", revisions.len()))
+                            .size(11.0).color(muted));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let order_lbl = if self.rev_reversed { "newest first" } else { "oldest first" };
+                            if ui.small_button(order_lbl).clicked() {
+                                self.rev_reversed = !self.rev_reversed;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    let mut revisions_sorted = revisions.clone();
+                    if self.rev_reversed {
+                        revisions_sorted.sort_by(|a, b| b.number.cmp(&a.number));
+                    } else {
+                        revisions_sorted.sort_by(|a, b| a.number.cmp(&b.number));
+                    }
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.set_max_width(ui.available_width());
+                        for rev in &revisions_sorted {
+                            let mut lb_out: Option<LightboxEntry> = None;
+                            self.draw_rev_row(ui, pid, rev, busy, dl_batch, &save_dir, pink, muted, ctx, &self.dims_cache.clone(), &mut lb_out);
+                            if lb_out.is_some() { self.lightbox = lb_out; }
+                            ui.add_space(6.0);
                         }
                     });
-                });
-                ui.add_space(4.0);
-                let mut revisions_sorted = revisions.clone();
-                if self.rev_reversed {
-                    revisions_sorted.sort_by(|a, b| b.number.cmp(&a.number));
-                } else {
-                    revisions_sorted.sort_by(|a, b| a.number.cmp(&b.number));
                 }
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.set_max_width(ui.available_width());
-                    for rev in &revisions_sorted {
-                        self.draw_rev_row(ui, pid, rev, busy, dl_batch, &save_dir, pink, muted, ctx, &self.dims_cache.clone());
-                        ui.add_space(6.0);
-                    }
-                });
-            }
+
+            } // end else (scanner)
         });
     }
 }
 
 impl App {
+    fn load_cache(&self, ctx: &egui::Context) {
+        let cache = Arc::clone(&self.cache_tab);
+        let ctx2  = ctx.clone();
+        {
+            let mut c = cache.lock().unwrap();
+            c.loading = true;
+            c.loaded  = false;
+            c.entries.clear();
+            c.total_size = 0;
+        }
+        thread::spawn(move || {
+            let cache_dir = get_imvu_cache_dir();
+            let mut entries: Vec<CacheEntry> = Vec::new();
+            let mut total_size = 0u64;
+
+            if let Ok(top_iter) = std::fs::read_dir(&cache_dir) {
+                for top in top_iter.flatten() {
+                    if let Ok(mid_iter) = std::fs::read_dir(top.path()) {
+                        for mid in mid_iter.flatten() {
+                            if let Ok(file_iter) = std::fs::read_dir(mid.path()) {
+                                for file in file_iter.flatten() {
+                                    let path = file.path();
+                                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                    total_size += size;
+                                    let fname = path.file_name()
+                                        .unwrap_or_default().to_string_lossy().to_string();
+                                    if !fname.starts_with("product") { continue; }
+                                    let pid: u64 = fname.split('_').next()
+                                        .unwrap_or("").replace("product", "")
+                                        .parse().unwrap_or(0);
+                                    if pid == 0 { continue; }
+                                    let files = read_cfl3_filenames(&path);
+                                    entries.push(CacheEntry { pid, files, size });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            entries.sort_by_key(|e| e.pid);
+            let mut c = cache.lock().unwrap();
+            c.entries    = entries;
+            c.total_size = total_size;
+            c.loading    = false;
+            c.loaded     = true;
+            ctx2.request_repaint();
+        });
+    }
+
+    fn delete_cache(&self, ctx: &egui::Context) {
+        let cache = Arc::clone(&self.cache_tab);
+        let ctx2  = ctx.clone();
+        {
+            cache.lock().unwrap().delete_state = CacheDeleteState::Deleting { done: 0, total: 0 };
+        }
+        thread::spawn(move || {
+            let imvu_dir  = get_imvu_dir();
+            let cache_dir = imvu_dir.join("HttpCache");
+
+            if !cache_dir.exists() {
+                cache.lock().unwrap().delete_state = CacheDeleteState::Error(
+                    "HttpCache folder not found".into());
+                ctx2.request_repaint();
+                return;
+            }
+
+            // Collect all files first
+            let mut all_files: Vec<PathBuf> = Vec::new();
+            collect_files(&cache_dir, &mut all_files);
+            let total = all_files.len();
+
+            // Rename the IMVU dir so IMVU can recreate it fresh
+            let renamed = imvu_dir.with_file_name("IMVU_old_cache");
+            if renamed.exists() {
+                let _ = std::fs::remove_dir_all(&renamed);
+            }
+            if let Err(e) = std::fs::rename(&imvu_dir, &renamed) {
+                cache.lock().unwrap().delete_state = CacheDeleteState::Error(
+                    format!("rename failed: {} — close IMVU first", e));
+                ctx2.request_repaint();
+                return;
+            }
+
+            // Delete files from renamed dir
+            let renamed_cache = renamed.join("HttpCache");
+            let mut renamed_files: Vec<PathBuf> = Vec::new();
+            collect_files(&renamed_cache, &mut renamed_files);
+            let total2 = renamed_files.len().max(total);
+
+            for (i, file) in renamed_files.iter().enumerate() {
+                let _ = std::fs::remove_file(file);
+                cache.lock().unwrap().delete_state = CacheDeleteState::Deleting {
+                    done: i + 1, total: total2,
+                };
+                ctx2.request_repaint();
+            }
+
+            // Remove leftover dirs
+            let _ = std::fs::remove_dir_all(&renamed);
+
+            let mut c = cache.lock().unwrap();
+            c.delete_state = CacheDeleteState::Done;
+            c.entries.clear();
+            c.total_size = 0;
+            c.loaded = false;
+            ctx2.request_repaint();
+        });
+    }
+
+    fn draw_cache_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context,
+                      pink: egui::Color32, muted: egui::Color32,
+                      green: egui::Color32, red: egui::Color32, _amber: egui::Color32) {
+        let (loading, loaded, total_size, entry_count, delete_state) = {
+            let c = self.cache_tab.lock().unwrap();
+            (c.loading, c.loaded, c.total_size, c.entries.len(), c.delete_state.clone())
+        };
+
+        if loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(egui::RichText::new("Scanning cache...").size(12.0).color(muted));
+            });
+            ctx.request_repaint();
+            return;
+        }
+
+        if !loaded {
+            ui.label(egui::RichText::new("Loading...").size(12.0).color(muted));
+            return;
+        }
+
+        // Footer panel — must be declared before scroll area in egui
+        let footer_id = ui.id().with("cache_footer");
+        egui::TopBottomPanel::bottom(footer_id)
+            .frame(egui::Frame::none()
+                .fill(egui::Color32::from_rgb(20, 12, 18))
+                .inner_margin(egui::Margin::symmetric(0.0, 6.0)))
+            .show_inside(ui, |ui| {
+                ui.separator();
+                ui.add_space(4.0);
+                match &delete_state {
+                    CacheDeleteState::Idle => {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format_bytes(total_size))
+                                .size(11.0).color(muted));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let btn = egui::Button::new(
+                                    egui::RichText::new("Clear cache").size(11.0).color(muted).italics()
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .frame(false);
+                                if ui.add(btn).clicked() {
+                                    self.cache_tab.lock().unwrap().confirm_delete = true;
+                                }
+                            });
+                        });
+                    }
+                    CacheDeleteState::Deleting { done, total } => {
+                        let p = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
+                        ui.label(egui::RichText::new("You can open IMVU now.")
+                            .size(11.0).color(green));
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(egui::RichText::new(format!("Clearing... {}/{}", done, total))
+                                .size(11.0).color(muted));
+                        });
+                        ui.add(egui::ProgressBar::new(p).show_percentage());
+                        ctx.request_repaint();
+                    }
+                    CacheDeleteState::Done => {
+                        ui.label(egui::RichText::new("Cache cleared.")
+                            .size(11.0).color(green));
+                    }
+                    CacheDeleteState::Error(e) => {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("Error: {}", e))
+                                .size(11.0).color(red));
+                            let retry = egui::Button::new(
+                                egui::RichText::new("Try again").size(11.0).color(muted).italics()
+                            )
+                            .fill(egui::Color32::TRANSPARENT)
+                            .frame(false);
+                            if ui.add(retry).clicked() {
+                                self.cache_tab.lock().unwrap().delete_state = CacheDeleteState::Idle;
+                            }
+                        });
+                    }
+                }
+            });
+
+        // Header
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!(
+                "{} cached products", entry_count
+            )).size(13.0).color(pink).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let btn = egui::Button::new(egui::RichText::new("Refresh").size(11.0).color(egui::Color32::WHITE))
+                    .fill(egui::Color32::from_rgb(42, 24, 36))
+                    .rounding(egui::Rounding::same(5.0));
+                if ui.add(btn).clicked() { self.load_cache(ctx); }
+            });
+        });
+
+        ui.add_space(4.0);
+
+        // Search
+        let search = {
+            let mut ct = self.cache_tab.lock().unwrap();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Filter:").size(11.0).color(muted));
+                ui.add(egui::TextEdit::singleline(&mut ct.search)
+                    .desired_width(ui.available_width())
+                    .hint_text("product ID..."));
+            });
+            ct.search.trim().to_string()
+        };
+
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Product list
+        let entries = self.cache_tab.lock().unwrap().entries.clone();
+        let filtered: Vec<&CacheEntry> = entries.iter()
+            .filter(|e| search.is_empty() || e.pid.to_string().contains(&search))
+            .collect();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_max_width(ui.available_width());
+            for entry in &filtered {
+                let available_w = ui.available_width();
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(30, 18, 26))
+                    .rounding(egui::Rounding::same(6.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(available_w - 24.0);
+                        ui.horizontal(|ui| {
+                            egui::Frame::none()
+                                .fill(egui::Color32::from_rgb(45, 25, 38))
+                                .rounding(egui::Rounding::same(4.0))
+                                .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new(format!("{}", entry.pid))
+                                        .size(12.0).color(pink).strong());
+                                });
+                            ui.label(egui::RichText::new(format_bytes(entry.size))
+                                .size(11.0).color(muted));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let btn = egui::Button::new(
+                                    egui::RichText::new("Scan").size(11.0).color(egui::Color32::WHITE)
+                                )
+                                .fill(egui::Color32::from_rgb(175, 55, 105))
+                                .rounding(egui::Rounding::same(5.0));
+                                if ui.add(btn).clicked() {
+                                    self.input = entry.pid.to_string();
+                                    self.show_cache = false;
+                                    self.start_scan(ctx);
+                                }
+
+                            });
+                        });
+
+                        if !entry.files.is_empty() {
+                            ui.add_space(3.0);
+                            ui.label(egui::RichText::new(entry.files.join("  ·  "))
+                                .size(10.0).color(egui::Color32::from_rgb(90, 65, 80)));
+                        }
+                    });
+                ui.add_space(4.0);
+            }
+        });
+
+        // Confirmation window
+        let confirm = self.cache_tab.lock().unwrap().confirm_delete;
+        if confirm {
+            let screen = ctx.screen_rect();
+            egui::Window::new("##confirm_clear")
+                .title_bar(false)
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .frame(egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(28, 14, 22))
+                    .rounding(egui::Rounding::same(10.0))
+                    .inner_margin(egui::Margin::same(20.0))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 35, 58))))
+                .show(ctx, |ui| {
+                    ui.label(egui::RichText::new("Clear IMVU Cache")
+                        .size(15.0).color(pink).strong());
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Have you closed IMVU?")
+                        .size(12.0).color(egui::Color32::from_rgb(200, 160, 180)));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        let yes = egui::Button::new(
+                            egui::RichText::new("  Yes, clear it  ").size(12.0).color(egui::Color32::WHITE)
+                        )
+                        .fill(egui::Color32::from_rgb(160, 40, 60))
+                        .rounding(egui::Rounding::same(6.0));
+                        if ui.add(yes).clicked() {
+                            self.cache_tab.lock().unwrap().confirm_delete = false;
+                            self.delete_cache(ctx);
+                        }
+                        ui.add_space(8.0);
+                        let no = egui::Button::new(
+                            egui::RichText::new("  Cancel  ").size(12.0)
+                                .color(egui::Color32::from_rgb(160, 120, 140))
+                        )
+                        .fill(egui::Color32::from_rgb(40, 24, 35))
+                        .rounding(egui::Rounding::same(6.0));
+                        if ui.add(no).clicked() {
+                            self.cache_tab.lock().unwrap().confirm_delete = false;
+                        }
+                    });
+                });
+            let _ = screen;
+        }
+    }
+
     fn draw_rev_row(&self, ui: &mut egui::Ui, pid: u64, rev: &Revision,
                     busy: bool, dl_batch: usize, save_dir: &PathBuf,
                     pink: egui::Color32, muted: egui::Color32, ctx: &egui::Context,
-                    dims_cache: &DimsCache) {
-        let media: Vec<&ManifestEntry> = rev.manifest.iter().filter(|f| is_media(&f.name)).collect();
-        let other: Vec<&ManifestEntry> = rev.manifest.iter().filter(|f| !is_media(&f.name)).collect();
+                    dims_cache: &DimsCache, self_lightbox: &mut Option<LightboxEntry>) {
+        let media: Vec<&ManifestEntry> = rev.manifest.iter().filter(|f| is_media_or_unknown(&f.name)).collect();
+        let other: Vec<&ManifestEntry> = rev.manifest.iter().filter(|f| !is_media_or_unknown(&f.name)).collect();
 
         let available_w = ui.available_width();
         egui::Frame::none()
@@ -551,8 +1077,11 @@ impl App {
                                                         (128u32, 128u32, s.into_raw())
                                                     } else { (orig_w, orig_h, rgba.into_raw()) };
                                                     pending.lock().unwrap().push((key2, orig_w, orig_h, dw, dh, pixels));
-                                                    ctx2.request_repaint();
+                                                } else {
+                                                    // Not an image — mark as failed so UI can fall back
+                                                    pending.lock().unwrap().push((key2, 0, 0, 0, 0, vec![]));
                                                 }
+                                                ctx2.request_repaint();
                                             }
                                         }
                                     });
@@ -565,15 +1094,65 @@ impl App {
                                 Some(TexEntry::Loaded(handle)) => {
                                     let img = egui::Image::new(&handle)
                                         .fit_to_exact_size(egui::vec2(64.0, 64.0))
-                                        .rounding(egui::Rounding::same(4.0));
-                                    let hover_txt = if let Some(&(w, h)) = dims_cache.lock().unwrap().get(&key) {
+                                        .rounding(egui::Rounding::same(4.0))
+                                        .sense(egui::Sense::click());
+                                    let dims = dims_cache.lock().unwrap().get(&key).copied();
+                                    let hover_txt = if let Some((w, h)) = dims {
                                         format!("{} - {}x{}", entry.name, w, h)
                                     } else {
                                         entry.name.clone()
                                     };
-                                    Some(ui.add(img).on_hover_text(hover_txt))
+                                    let resp = ui.add(img).on_hover_text(&hover_txt);
+                                    if resp.clicked() {
+                                        let fmt = entry.name.rsplit('.').next().unwrap_or("").to_lowercase();
+                                        let fullres_key = format!("fullres_{}", key);
+                                        let already = self.textures.lock().unwrap().contains_key(&fullres_key);
+                                        if !already {
+                                            self.textures.lock().unwrap().insert(fullres_key.clone(), TexEntry::Loading);
+                                            let fkey    = fullres_key.clone();
+                                            let furl    = fetch_url.clone();
+                                            let pending = Arc::clone(&self.pending_tex);
+                                            let ctx2    = ctx.clone();
+                                            thread::spawn(move || {
+                                                if let Ok(resp) = reqwest::blocking::get(&furl) {
+                                                    if let Ok(bytes) = resp.bytes() {
+                                                        if let Ok(img) = image::load_from_memory(&bytes) {
+                                                            let rgba = img.to_rgba8();
+                                                            let (w, h) = rgba.dimensions();
+                                                            pending.lock().unwrap().push((fkey, w, h, w, h, rgba.into_raw()));
+                                                            ctx2.request_repaint();
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        *self_lightbox = Some(LightboxEntry {
+                                            key:       fullres_key,
+                                            name:      entry.name.clone(),
+                                            orig_w:    dims.map(|d| d.0).unwrap_or(0),
+                                            orig_h:    dims.map(|d| d.1).unwrap_or(0),
+                                            format:    fmt,
+                                            fetch_url: fetch_url.clone(),
+                                        });
+                                    }
+                                    Some(resp)
                                 }
-                                Some(TexEntry::Failed) => placeholder(ui, "X"),
+                                Some(TexEntry::Failed) => {
+                                    if !entry.name.contains('.') {
+                                        // Not an image — show as a file tag inline
+                                        let muted_color = egui::Color32::from_rgb(110, 90, 100);
+                                        egui::Frame::none()
+                                            .fill(egui::Color32::from_rgb(26, 15, 22))
+                                            .rounding(egui::Rounding::same(3.0))
+                                            .inner_margin(egui::Margin::symmetric(5.0, 2.0))
+                                            .show(ui, |ui| {
+                                                ui.label(egui::RichText::new(&entry.name).size(10.0).color(muted_color));
+                                            });
+                                        None
+                                    } else {
+                                        placeholder(ui, "X")
+                                    }
+                                }
                             };
 
                             if let Some(resp) = thumb_response {
@@ -721,7 +1300,6 @@ impl App {
                                     .as_str()
                                     .and_then(|s| s.split("product-").last())
                                     .and_then(|s| s.parse::<u64>().ok());
-                                // fetch parent name if there is one
                                 let parent_name = if let Some(ppid) = parent_id {
                                     let purl = format!("https://api.imvu.com/product/product-{}", ppid);
                                     let pkey = format!("https://api.imvu.com/product/product-{}", ppid);
@@ -813,7 +1391,7 @@ impl App {
                 .build().unwrap();
 
             let files: Vec<&ManifestEntry> = match dl_mode {
-                DownloadMode::MediaOnly => rev.manifest.iter().filter(|f| is_media(&f.name)).collect(),
+                DownloadMode::MediaOnly => rev.manifest.iter().filter(|f| is_media_or_unknown(&f.name)).collect(),
                 _                      => rev.manifest.iter().collect(),
             };
             let total   = files.len();
@@ -863,6 +1441,19 @@ impl App {
                 }
                 drop(tx);
                 for (name, mime, bytes) in rx {
+                    // For media-only mode, skip files that turned out not to be images
+                    if dl_mode == DownloadMode::MediaOnly && !is_media(&name) {
+                        let is_image_mime = matches!(mime.as_str(),
+                            "image/png" | "image/jpeg" | "image/jpg" | "image/gif" |
+                            "image/bmp" | "image/webp" | "image/tiff" |
+                            "image/x-tga" | "image/x-targa");
+                        if !is_image_mime && detect_ext(&bytes).is_none() {
+                            done += 1;
+                            *progress.lock().unwrap() = done as f32 / total as f32;
+                            ctx.request_repaint();
+                            continue;
+                        }
+                    }
                     let out_name = if fix_ext { fix_extension_mime(&name, &mime, &bytes) } else { name };
                     if let Some(ref mut zw) = zip_writer {
                         if zw.start_file(&out_name, opts).is_ok() { let _ = zw.write_all(&bytes); }
@@ -897,6 +1488,87 @@ impl App {
             }
             ctx.request_repaint();
         });
+    }
+}
+
+fn get_imvu_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("C:\\Users\\PC\\AppData\\Roaming"))
+        .join("IMVU")
+}
+
+fn get_imvu_cache_dir() -> PathBuf {
+    get_imvu_dir().join("HttpCache")
+}
+
+fn collect_files(dir: &PathBuf, out: &mut Vec<PathBuf>) {
+    if let Ok(iter) = std::fs::read_dir(dir) {
+        for e in iter.flatten() {
+            let p = e.path();
+            if p.is_dir() { collect_files(&p, out); }
+            else { out.push(p); }
+        }
+    }
+}
+
+fn read_cfl3_filenames(path: &PathBuf) -> Vec<String> {
+    let mut f = match std::fs::File::open(path) { Ok(f) => f, Err(_) => return vec![] };
+    let mut header = [0u8; 4];
+    if f.read_exact(&mut header).is_err() { return vec![]; }
+    if &header != b"CFL3" && &header != b"DFL3" { return vec![]; }
+
+    let dir_offset = read_u32_file(&mut f);
+    let _uncomp    = read_u32_file(&mut f);
+    if f.seek(std::io::SeekFrom::Start(dir_offset as u64)).is_err() { return vec![]; }
+    let _comp_type    = read_u32_file(&mut f);
+    let comp_size     = read_u32_file(&mut f);
+    let mut comp_data = vec![0u8; comp_size as usize];
+    if f.read_exact(&mut comp_data).is_err() { return vec![]; }
+
+    let directory = match decompress_cfl3(&comp_data) { Ok(d) => d, Err(_) => return vec![] };
+
+    let mut names = Vec::new();
+    let mut pos = 0usize;
+    while pos + 14 <= directory.len() {
+        let namelen = i16::from_le_bytes([directory[pos+12], directory[pos+13]]) as usize;
+        pos += 14;
+        if pos + namelen > directory.len() { break; }
+        if let Ok(name) = std::str::from_utf8(&directory[pos..pos+namelen]) {
+            names.push(name.to_string());
+        }
+        pos += namelen;
+    }
+    names
+}
+
+fn read_u32_file(f: &mut std::fs::File) -> u32 {
+    let mut buf = [0u8; 4];
+    let _ = f.read_exact(&mut buf);
+    u32::from_le_bytes(buf)
+}
+
+fn decompress_cfl3(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() < 6 { return Err("too short".into()); }
+    let mut alone = data[..5].to_vec();
+    alone.extend_from_slice(&[0xffu8; 8]);
+    alone.extend_from_slice(&data[5..]);
+    let mut out = Vec::new();
+    lzma_rs::lzma_decompress(&mut std::io::Cursor::new(alone), &mut out)
+        .map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
     }
 }
 
@@ -974,11 +1646,35 @@ fn extract_pid(s: &str) -> Option<u64> {
 const MEDIA_EXTS: &[&str] = &["png","jpg","jpeg","gif","bmp","dds","tga","webp","tiff","tif"];
 const MESH_EXTS:  &[&str] = &["xsf","xaf","xrf","xmf","xcf","xof"];
 
-fn is_media(name: &str) -> bool {
-    MEDIA_EXTS.contains(&name.rsplit('.').next().unwrap_or("").to_lowercase().as_str())
+fn file_ext(name: &str) -> Option<&str> {
+    let ext = name.rsplit('.').next()?;
+    // Only treat as extension if it's short, alphabetic, and not the whole name
+    if ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphabetic()) && ext != name {
+        Some(ext)
+    } else {
+        None
+    }
 }
+
+fn is_media(name: &str) -> bool {
+    match file_ext(name) {
+        Some(ext) => MEDIA_EXTS.contains(&ext.to_lowercase().as_str()),
+        None => false,
+    }
+}
+
+fn is_media_or_unknown(name: &str) -> bool {
+    match file_ext(name) {
+        Some(ext) => MEDIA_EXTS.contains(&ext.to_lowercase().as_str()),
+        None => true, // no real extension — attempt as media
+    }
+}
+
 fn is_mesh(name: &str) -> bool {
-    MESH_EXTS.contains(&name.rsplit('.').next().unwrap_or("").to_lowercase().as_str())
+    match file_ext(name) {
+        Some(ext) => MESH_EXTS.contains(&ext.to_lowercase().as_str()),
+        None => false,
+    }
 }
 
 fn fix_extension_mime(name: &str, mime: &str, bytes: &[u8]) -> String {
