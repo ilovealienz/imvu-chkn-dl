@@ -13,7 +13,7 @@ use std::{
 
 const FONT_BYTES: &[u8] = include_bytes!("../JetBrainsMono-Regular.ttf");
 const FONT_INTER: &[u8] = include_bytes!("../InterVariable.ttf");
-const ICON_PNG:   &[u8] = include_bytes!("../chkn-logo-32.png");
+const ICON_PNG: &[u8] = include_bytes!("../chkn-logo-256.png");
 
 #[derive(Debug, Clone, Deserialize)]
 struct ManifestEntry {
