@@ -19,10 +19,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: chkn-dl
 
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: chkn-dl
-
     runs-on: ${{ matrix.os }}
 
     steps:
