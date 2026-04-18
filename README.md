@@ -2,7 +2,7 @@
 
 ![preview](preview.png)
 
-a little tool for grabbing IMVU product files — paste in a product ID or URL, it scans all the revisions and lets you download them however you want.
+a little tool for grabbing IMVU product files. paste in a product ID or URL, it scans all the revisions and lets you download them however you want.
 
 ## what it does
 
